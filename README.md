@@ -1,3 +1,3 @@
-# ncrpcclient
+# minincrpcclient
 
-ncrpcclient is a companion package to [Conformal's rpcclient](https://github.com/btcsuite/btcd/tree/master/rpcclient), which adds Namecoin-specific RPC methods.
+minincrpcclient is a fork of [ncrpcclient](https://github.com/namecoin/ncrpcclient) that eliminates the dependency on btcd. This may reduce binary size and attack surface.

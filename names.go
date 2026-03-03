@@ -1,41 +1,41 @@
 // Copyright (c) 2014-2017 The btcsuite developers
-// Copyright (c) 2019 The Namecoin developers
+// Copyright (c) 2019-2026 The Namecoin developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
-package ncrpcclient
+package minincrpcclient
 
 import (
+	"context"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 
-	"github.com/btcsuite/btcd/rpcclient"
-	"github.com/namecoin/ncbtcjson"
+	ncbtcjson "github.com/namecoin/minincbtcjson"
 )
 
 // *********************
 // Name Lookup Functions
 // *********************
 
-// FutureNameShowResult is a future promise to deliver the result
-// of a NameShowAsync RPC invocation (or an applicable error).
-type FutureNameShowResult chan *rpcclient.Response
-
-// Receive waits for the Response promised by the future and returns detailed
-// information about a name.
-func (r FutureNameShowResult) Receive() (*ncbtcjson.NameShowResult, error) {
-	res, err := rpcclient.ReceiveFuture(r)
-	if err != nil {
-		return nil, fmt.Errorf("receive future: %w", err)
+// NameShow returns detailed information about a name.
+func (c *Client) NameShow(name string, options *ncbtcjson.NameShowOptions) (*ncbtcjson.NameShowResult, error) {
+	if options == nil {
+		options = &ncbtcjson.NameShowOptions{}
 	}
 
-	// Unmarshal result as a name_show result object
-	var nameShow ncbtcjson.NameShowResult
+	options.NameEncoding, options.ValueEncoding = ncbtcjson.Hex, ncbtcjson.Hex
+	name = hex.EncodeToString([]byte(name))
 
-	err = json.Unmarshal(res, &nameShow)
+	var nameShow *ncbtcjson.NameShowResult
+
+	err := c.CallFor(context.Background(), &nameShow, "name_show", name, options)
+
 	if err != nil {
-		return nil, fmt.Errorf("unmarshal result: %w", err)
+		return nil, err
+	}
+
+	if nameShow == nil {
+		return nil, nil
 	}
 
 	if nameShow.NameEncoding == ncbtcjson.Hex {
@@ -60,67 +60,23 @@ func (r FutureNameShowResult) Receive() (*ncbtcjson.NameShowResult, error) {
 		nameShow.Value = string(valueBytes)
 	}
 
-	return &nameShow, nil
-}
-
-// NameShowAsync returns an instance of a type that can be used to get the
-// result of the RPC at some future time by invoking the Receive function on
-// the returned instance.
-//
-// See NameShow for the blocking version and more details.
-func (c *Client) NameShowAsync(name string, options *ncbtcjson.NameShowOptions) FutureNameShowResult {
-	if options == nil {
-		options = &ncbtcjson.NameShowOptions{}
-	}
-
-	options.NameEncoding, options.ValueEncoding = ncbtcjson.Hex, ncbtcjson.Hex
-	name = hex.EncodeToString([]byte(name))
-
-	cmd := ncbtcjson.NewNameShowCmd(name, options)
-
-	return c.SendCmd(cmd)
-}
-
-// NameShow returns detailed information about a name.
-func (c *Client) NameShow(name string, options *ncbtcjson.NameShowOptions) (*ncbtcjson.NameShowResult, error) {
-	return c.NameShowAsync(name, options).Receive()
-}
-
-// FutureNameScanResult is a future promise to deliver the result
-// of a NameScanAsync RPC invocation (or an applicable error).
-type FutureNameScanResult chan *rpcclient.Response
-
-// Receive waits for the Response promised by the future and returns detailed
-// information about a list of names.
-func (r FutureNameScanResult) Receive() (ncbtcjson.NameScanResult, error) {
-	res, err := rpcclient.ReceiveFuture(r)
-	if err != nil {
-		return nil, fmt.Errorf("receive future: %w", err)
-	}
-
-	// Unmarshal result as a name_scan result object
-	var nameScan ncbtcjson.NameScanResult
-
-	err = json.Unmarshal(res, &nameScan)
-	if err != nil {
-		return nil, fmt.Errorf("unmarshal result: %w", err)
-	}
-
-	return nameScan, nil
-}
-
-// NameScanAsync returns an instance of a type that can be used to get the
-// result of the RPC at some future time by invoking the Receive function on
-// the returned instance.
-//
-// See NameScan for the blocking version and more details.
-func (c *Client) NameScanAsync(start string, count uint32) FutureNameScanResult {
-	cmd := ncbtcjson.NewNameScanCmd(start, &count, nil)
-
-	return c.SendCmd(cmd)
+	return nameShow, nil
 }
 
 // NameScan returns detailed information about a list of names.
+// TODO: handle options and hex encoding
 func (c *Client) NameScan(start string, count uint32) (ncbtcjson.NameScanResult, error) {
-	return c.NameScanAsync(start, count).Receive()
+	var nameScan *ncbtcjson.NameScanResult
+
+	err := c.CallFor(context.Background(), &nameScan, "name_scan", start, count)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if nameScan == nil {
+		return nil, nil
+	}
+
+	return *nameScan, nil
 }
