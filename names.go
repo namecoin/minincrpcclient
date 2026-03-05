@@ -13,6 +13,28 @@ import (
 	ncbtcjson "github.com/namecoin/minincbtcjson"
 )
 
+func decodeHexResult(nameShow *ncbtcjson.NameShowResult) error {
+	if nameShow.NameEncoding == ncbtcjson.Hex {
+		nameBytes, err := hex.DecodeString(nameShow.Name)
+		if err != nil {
+			return fmt.Errorf("decode hex name: %w", err)
+		}
+
+		nameShow.Name = string(nameBytes)
+	}
+
+	if nameShow.ValueEncoding == ncbtcjson.Hex {
+		valueBytes, err := hex.DecodeString(nameShow.Value)
+		if err != nil {
+			return fmt.Errorf("decode hex value: %w", err)
+		}
+
+		nameShow.Value = string(valueBytes)
+	}
+
+	return nil
+}
+
 // *********************
 // Name Lookup Functions
 // *********************
@@ -23,6 +45,7 @@ func (c *Client) NameShow(name string, options *ncbtcjson.NameShowOptions) (*ncb
 		options = &ncbtcjson.NameShowOptions{}
 	}
 
+	// Use hex
 	options.NameEncoding, options.ValueEncoding = ncbtcjson.Hex, ncbtcjson.Hex
 	name = hex.EncodeToString([]byte(name))
 
@@ -38,26 +61,10 @@ func (c *Client) NameShow(name string, options *ncbtcjson.NameShowOptions) (*ncb
 		return nil, nil
 	}
 
-	if nameShow.NameEncoding == ncbtcjson.Hex {
-		var nameBytes []byte
-
-		nameBytes, err = hex.DecodeString(nameShow.Name)
-		if err != nil {
-			return nil, fmt.Errorf("decode hex name: %w", err)
-		}
-
-		nameShow.Name = string(nameBytes)
-	}
-
-	if nameShow.ValueEncoding == ncbtcjson.Hex {
-		var valueBytes []byte
-
-		valueBytes, err = hex.DecodeString(nameShow.Value)
-		if err != nil {
-			return nil, fmt.Errorf("decode hex value: %w", err)
-		}
-
-		nameShow.Value = string(valueBytes)
+	// Decode hex
+	err = decodeHexResult(nameShow)
+	if err != nil {
+		return nil, err
 	}
 
 	return nameShow, nil
@@ -65,10 +72,19 @@ func (c *Client) NameShow(name string, options *ncbtcjson.NameShowOptions) (*ncb
 
 // NameScan returns detailed information about a list of names.
 // TODO: handle options and hex encoding
-func (c *Client) NameScan(start string, count uint32) (ncbtcjson.NameScanResult, error) {
+func (c *Client) NameScan(start string, count uint32, options *ncbtcjson.NameScanOptions) (ncbtcjson.NameScanResult, error) {
+	if options == nil {
+		options = &ncbtcjson.NameScanOptions{}
+	}
+
+	// Use hex
+	options.NameEncoding, options.ValueEncoding = ncbtcjson.Hex, ncbtcjson.Hex
+	start = hex.EncodeToString([]byte(start))
+	options.Prefix = hex.EncodeToString([]byte(options.Prefix))
+
 	var nameScan *ncbtcjson.NameScanResult
 
-	err := c.CallFor(context.Background(), &nameScan, "name_scan", start, count)
+	err := c.CallFor(context.Background(), &nameScan, "name_scan", start, count, options)
 
 	if err != nil {
 		return nil, err
@@ -76,6 +92,14 @@ func (c *Client) NameScan(start string, count uint32) (ncbtcjson.NameScanResult,
 
 	if nameScan == nil {
 		return nil, nil
+	}
+
+	// Decode hex
+	for _, nameShow := range *nameScan {
+		err = decodeHexResult(&nameShow)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return *nameScan, nil
