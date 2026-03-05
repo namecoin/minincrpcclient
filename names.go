@@ -95,8 +95,8 @@ func (c *Client) NameScan(start string, count uint32, options *ncbtcjson.NameSca
 	}
 
 	// Decode hex
-	for _, nameShow := range *nameScan {
-		err = decodeHexResult(&nameShow)
+	for i, _ := range *nameScan {
+		err = decodeHexResult(&(*nameScan)[i])
 		if err != nil {
 			return nil, err
 		}
