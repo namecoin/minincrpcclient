@@ -35,6 +35,7 @@ func (client *Client) reset() error {
 	}
 
 	rpcClient := jsonrpc.NewClientWithOpts(endpoint, &jsonrpc.RPCClientOpts{
+		AllowUnknownFields: true,
 		CustomHeaders: map[string]string{
 			"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass)),
 		},
