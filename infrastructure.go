@@ -6,13 +6,55 @@
 package minincrpcclient
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
-
-	"github.com/ybbus/jsonrpc/v3"
 )
+
+// jsonRPCRequest represents a JSON-RPC 2.0 request.
+type jsonRPCRequest struct {
+	JSONRPC string      `json:"jsonrpc"`
+	Method  string      `json:"method"`
+	Params  interface{} `json:"params,omitempty"`
+	ID      uint64      `json:"id"`
+}
+
+// jsonRPCResponse represents a JSON-RPC 2.0 response.
+// Result is kept as json.RawMessage to avoid an intermediate interface{}
+// parse and the resulting re-marshal round-trip that was the primary
+// bottleneck in the ybbus/jsonrpc library.
+type jsonRPCResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *jsonRPCError   `json:"error,omitempty"`
+	ID      uint64          `json:"id"`
+}
+
+// jsonRPCError represents a JSON-RPC 2.0 error object.
+type jsonRPCError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func (e *jsonRPCError) Error() string {
+	return fmt.Sprintf("%d: %s", e.Code, e.Message)
+}
+
+// HTTPError represents an error that occurred at the HTTP transport level.
+type HTTPError struct {
+	Code int
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("http error: status code %d", e.Code)
+}
 
 // Client represents a Namecoin RPC client which allows easy access to the
 // various RPC methods available on a Namecoin RPC server.  Each of the wrapper
@@ -20,52 +62,101 @@ import (
 // from the underlying JSON types which are required for the JSON-RPC
 // invocations
 type Client struct {
-	c jsonrpc.RPCClient
+	httpClient *http.Client
+	endpoint   string
 
 	config *ConnConfig
+
+	nextID uint64
 }
 
-// TODO: ask ybbus about making auth mutable, would simplify this a lot
-func (client *Client) reset() error {
-	endpoint := "http://" + client.config.Host
+// authHeader returns the current HTTP Basic Authorization header value.
+// Because we read credentials via ConnConfig.getAuth() on every call,
+// cookie-based credentials are always up to date — there is no stale
+// cached header.  This is the "mutable auth" that ybbus/jsonrpc could
+// not provide (see issue #1).
+func (client *Client) authHeader() (string, error) {
 	user, pass, err := client.config.getAuth()
 	if err != nil {
-		client.c = nil
-		return err
+		return "", err
 	}
 
-	rpcClient := jsonrpc.NewClientWithOpts(endpoint, &jsonrpc.RPCClientOpts{
-		AllowUnknownFields: true,
-		CustomHeaders: map[string]string{
-			"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass)),
-		},
-	})
-
-	client.c = rpcClient
-
-	return nil
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass)), nil
 }
 
 func (client *Client) CallFor(ctx context.Context, out interface{}, method string, params ...interface{}) error {
-	err := client.c.CallFor(ctx, out, method, params...)
+	id := atomic.AddUint64(&client.nextID, 1)
 
-	// Detect an auth failure
+	req := &jsonRPCRequest{
+		JSONRPC: "2.0",
+		Method:  method,
+		Params:  params,
+		ID:      id,
+	}
+
+	body, err := json.Marshal(req)
 	if err != nil {
-		herr, ok := err.(*jsonrpc.HTTPError)
-		if ok {
-			if herr.Code == 401 {
-				// Try refreshing the auth
-				err = client.reset()
-				if err != nil {
-					return err
-				}
+		return fmt.Errorf("marshal request: %w", err)
+	}
 
-				err = client.c.CallFor(ctx, out, method, params...)
-			}
+	// Fetch credentials fresh for every request.  ConnConfig.getAuth()
+	// uses a 30-second TTL cache for cookie files, so this is cheap for
+	// the common case while still picking up rotated cookies promptly.
+	auth, err := client.authHeader()
+	if err != nil {
+		return fmt.Errorf("get auth: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", client.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create http request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+	httpReq.Header.Set("Authorization", auth)
+
+	httpResp, err := client.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("rpc call %s: %w", method, err)
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode >= 400 {
+		io.Copy(io.Discard, httpResp.Body) //nolint:errcheck
+
+		return &HTTPError{Code: httpResp.StatusCode}
+	}
+
+	respBytes, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
+
+	var rpcResp jsonRPCResponse
+
+	err = json.Unmarshal(respBytes, &rpcResp)
+	if err != nil {
+		return fmt.Errorf("unmarshal response: %w", err)
+	}
+
+	if rpcResp.Error != nil {
+		return rpcResp.Error
+	}
+
+	// Unmarshal the result directly from raw JSON bytes into the target
+	// type.  This is the key performance improvement: we skip the
+	// intermediate interface{} representation that ybbus/jsonrpc used,
+	// which required a re-marshal round-trip (interface{} -> []byte ->
+	// target struct).
+	if out != nil && rpcResp.Result != nil {
+		err = json.Unmarshal(rpcResp.Result, out)
+		if err != nil {
+			return fmt.Errorf("unmarshal result: %w", err)
 		}
 	}
 
-	return err
+	return nil
 }
 
 // Adapted from btcd
@@ -136,9 +227,17 @@ func (config *ConnConfig) retrieveCookie() (username, passphrase string, err err
 // interested in receiving notifications and will be ignored if the
 // configuration is set to run in HTTP POST mode.
 func New(config *ConnConfig) (*Client, error) {
-	client := &Client{c: nil, config: config}
+	// Verify that credentials are accessible at creation time.
+	_, _, err := config.getAuth()
+	if err != nil {
+		return nil, fmt.Errorf("get initial auth: %w", err)
+	}
 
-	err := client.reset()
+	client := &Client{
+		httpClient: &http.Client{},
+		endpoint:   "http://" + config.Host,
+		config:     config,
+	}
 
-	return client, err
+	return client, nil
 }
