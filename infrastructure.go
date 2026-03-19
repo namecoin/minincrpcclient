@@ -6,13 +6,55 @@
 package minincrpcclient
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
-
-	"github.com/ybbus/jsonrpc/v3"
 )
+
+// jsonRPCRequest represents a JSON-RPC 2.0 request.
+type jsonRPCRequest struct {
+	JSONRPC string      `json:"jsonrpc"`
+	Method  string      `json:"method"`
+	Params  interface{} `json:"params,omitempty"`
+	ID      uint64      `json:"id"`
+}
+
+// jsonRPCResponse represents a JSON-RPC 2.0 response.
+// Result is kept as json.RawMessage to avoid an intermediate interface{}
+// parse and the resulting re-marshal round-trip that was the primary
+// bottleneck in the ybbus/jsonrpc library.
+type jsonRPCResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *jsonRPCError   `json:"error,omitempty"`
+	ID      uint64          `json:"id"`
+}
+
+// jsonRPCError represents a JSON-RPC 2.0 error object.
+type jsonRPCError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func (e *jsonRPCError) Error() string {
+	return fmt.Sprintf("%d: %s", e.Code, e.Message)
+}
+
+// HTTPError represents an error that occurred at the HTTP transport level.
+type HTTPError struct {
+	Code int
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("http error: status code %d", e.Code)
+}
 
 // Client represents a Namecoin RPC client which allows easy access to the
 // various RPC methods available on a Namecoin RPC server.  Each of the wrapper
@@ -20,52 +62,119 @@ import (
 // from the underlying JSON types which are required for the JSON-RPC
 // invocations
 type Client struct {
-	c jsonrpc.RPCClient
+	httpClient *http.Client
+	endpoint   string
+	authHeader string
 
 	config *ConnConfig
+
+	nextID uint64
 }
 
 // TODO: ask ybbus about making auth mutable, would simplify this a lot
 func (client *Client) reset() error {
-	endpoint := "http://" + client.config.Host
 	user, pass, err := client.config.getAuth()
 	if err != nil {
-		client.c = nil
+		client.authHeader = ""
 		return err
 	}
 
-	rpcClient := jsonrpc.NewClientWithOpts(endpoint, &jsonrpc.RPCClientOpts{
-		AllowUnknownFields: true,
-		CustomHeaders: map[string]string{
-			"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass)),
-		},
-	})
-
-	client.c = rpcClient
+	client.authHeader = "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
 
 	return nil
 }
 
 func (client *Client) CallFor(ctx context.Context, out interface{}, method string, params ...interface{}) error {
-	err := client.c.CallFor(ctx, out, method, params...)
+	id := atomic.AddUint64(&client.nextID, 1)
 
-	// Detect an auth failure
+	req := &jsonRPCRequest{
+		JSONRPC: "2.0",
+		Method:  method,
+		Params:  params,
+		ID:      id,
+	}
+
+	body, err := json.Marshal(req)
 	if err != nil {
-		herr, ok := err.(*jsonrpc.HTTPError)
-		if ok {
-			if herr.Code == 401 {
-				// Try refreshing the auth
-				err = client.reset()
-				if err != nil {
-					return err
-				}
+		return fmt.Errorf("marshal request: %w", err)
+	}
 
-				err = client.c.CallFor(ctx, out, method, params...)
-			}
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", client.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create http request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json")
+	httpReq.Header.Set("Authorization", client.authHeader)
+
+	httpResp, err := client.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("rpc call %s: %w", method, err)
+	}
+	defer httpResp.Body.Close()
+
+	// Detect an auth failure and retry once with refreshed credentials.
+	if httpResp.StatusCode == 401 {
+		// Drain the body before retrying.
+		io.Copy(io.Discard, httpResp.Body) //nolint:errcheck
+		httpResp.Body.Close()
+
+		if rerr := client.reset(); rerr != nil {
+			return rerr
+		}
+
+		httpReq, err = http.NewRequestWithContext(ctx, "POST", client.endpoint, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("create http request: %w", err)
+		}
+
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "application/json")
+		httpReq.Header.Set("Authorization", client.authHeader)
+
+		httpResp, err = client.httpClient.Do(httpReq)
+		if err != nil {
+			return fmt.Errorf("rpc call %s: %w", method, err)
+		}
+		defer httpResp.Body.Close()
+	}
+
+	if httpResp.StatusCode >= 400 && httpResp.StatusCode != 401 {
+		io.Copy(io.Discard, httpResp.Body) //nolint:errcheck
+
+		return &HTTPError{Code: httpResp.StatusCode}
+	}
+
+	respBytes, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
+
+	var rpcResp jsonRPCResponse
+
+	err = json.Unmarshal(respBytes, &rpcResp)
+	if err != nil {
+		return fmt.Errorf("unmarshal response: %w", err)
+	}
+
+	if rpcResp.Error != nil {
+		return rpcResp.Error
+	}
+
+	// Unmarshal the result directly from raw JSON bytes into the target
+	// type.  This is the key performance improvement: we skip the
+	// intermediate interface{} representation that ybbus/jsonrpc used,
+	// which required a re-marshal round-trip (interface{} -> []byte ->
+	// target struct).
+	if out != nil && rpcResp.Result != nil {
+		err = json.Unmarshal(rpcResp.Result, out)
+		if err != nil {
+			return fmt.Errorf("unmarshal result: %w", err)
 		}
 	}
 
-	return err
+	return nil
 }
 
 // Adapted from btcd
@@ -136,7 +245,11 @@ func (config *ConnConfig) retrieveCookie() (username, passphrase string, err err
 // interested in receiving notifications and will be ignored if the
 // configuration is set to run in HTTP POST mode.
 func New(config *ConnConfig) (*Client, error) {
-	client := &Client{c: nil, config: config}
+	client := &Client{
+		httpClient: &http.Client{},
+		endpoint:   "http://" + config.Host,
+		config:     config,
+	}
 
 	err := client.reset()
 
