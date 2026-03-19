@@ -64,24 +64,24 @@ func (e *HTTPError) Error() string {
 type Client struct {
 	httpClient *http.Client
 	endpoint   string
-	authHeader string
 
 	config *ConnConfig
 
 	nextID uint64
 }
 
-// TODO: ask ybbus about making auth mutable, would simplify this a lot
-func (client *Client) reset() error {
+// authHeader returns the current HTTP Basic Authorization header value.
+// Because we read credentials via ConnConfig.getAuth() on every call,
+// cookie-based credentials are always up to date — there is no stale
+// cached header.  This is the "mutable auth" that ybbus/jsonrpc could
+// not provide (see issue #1).
+func (client *Client) authHeader() (string, error) {
 	user, pass, err := client.config.getAuth()
 	if err != nil {
-		client.authHeader = ""
-		return err
+		return "", err
 	}
 
-	client.authHeader = "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
-
-	return nil
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass)), nil
 }
 
 func (client *Client) CallFor(ctx context.Context, out interface{}, method string, params ...interface{}) error {
@@ -99,6 +99,14 @@ func (client *Client) CallFor(ctx context.Context, out interface{}, method strin
 		return fmt.Errorf("marshal request: %w", err)
 	}
 
+	// Fetch credentials fresh for every request.  ConnConfig.getAuth()
+	// uses a 30-second TTL cache for cookie files, so this is cheap for
+	// the common case while still picking up rotated cookies promptly.
+	auth, err := client.authHeader()
+	if err != nil {
+		return fmt.Errorf("get auth: %w", err)
+	}
+
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", client.endpoint, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create http request: %w", err)
@@ -106,7 +114,7 @@ func (client *Client) CallFor(ctx context.Context, out interface{}, method strin
 
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json")
-	httpReq.Header.Set("Authorization", client.authHeader)
+	httpReq.Header.Set("Authorization", auth)
 
 	httpResp, err := client.httpClient.Do(httpReq)
 	if err != nil {
@@ -114,33 +122,7 @@ func (client *Client) CallFor(ctx context.Context, out interface{}, method strin
 	}
 	defer httpResp.Body.Close()
 
-	// Detect an auth failure and retry once with refreshed credentials.
-	if httpResp.StatusCode == 401 {
-		// Drain the body before retrying.
-		io.Copy(io.Discard, httpResp.Body) //nolint:errcheck
-		httpResp.Body.Close()
-
-		if rerr := client.reset(); rerr != nil {
-			return rerr
-		}
-
-		httpReq, err = http.NewRequestWithContext(ctx, "POST", client.endpoint, bytes.NewReader(body))
-		if err != nil {
-			return fmt.Errorf("create http request: %w", err)
-		}
-
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Accept", "application/json")
-		httpReq.Header.Set("Authorization", client.authHeader)
-
-		httpResp, err = client.httpClient.Do(httpReq)
-		if err != nil {
-			return fmt.Errorf("rpc call %s: %w", method, err)
-		}
-		defer httpResp.Body.Close()
-	}
-
-	if httpResp.StatusCode >= 400 && httpResp.StatusCode != 401 {
+	if httpResp.StatusCode >= 400 {
 		io.Copy(io.Discard, httpResp.Body) //nolint:errcheck
 
 		return &HTTPError{Code: httpResp.StatusCode}
@@ -245,13 +227,17 @@ func (config *ConnConfig) retrieveCookie() (username, passphrase string, err err
 // interested in receiving notifications and will be ignored if the
 // configuration is set to run in HTTP POST mode.
 func New(config *ConnConfig) (*Client, error) {
+	// Verify that credentials are accessible at creation time.
+	_, _, err := config.getAuth()
+	if err != nil {
+		return nil, fmt.Errorf("get initial auth: %w", err)
+	}
+
 	client := &Client{
 		httpClient: &http.Client{},
 		endpoint:   "http://" + config.Host,
 		config:     config,
 	}
 
-	err := client.reset()
-
-	return client, err
+	return client, nil
 }
