@@ -8,7 +8,13 @@ package minincrpcclient
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ybbus/jsonrpc/v3"
@@ -34,11 +40,18 @@ func (client *Client) reset() error {
 		return err
 	}
 
+	httpClient, err := newHTTPClient(client.config)
+	if err != nil {
+		client.c = nil
+		return err
+	}
+
 	rpcClient := jsonrpc.NewClientWithOpts(endpoint, &jsonrpc.RPCClientOpts{
 		AllowUnknownFields: true,
 		CustomHeaders: map[string]string{
 			"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass)),
 		},
+		HTTPClient: httpClient,
 	})
 
 	client.c = rpcClient
@@ -76,10 +89,11 @@ func (client *Client) CallFor(ctx context.Context, out interface{}, method strin
 	return err
 }
 
-// Adapted from btcd
+// Begin code adapted from btcd
+
 type ConnConfig struct {
-	// Host is the IP address and port of the RPC server you want to connect
-	// to.
+	// Host is the IP address and port, or Unix socket path, of the RPC server
+	// you want to connect to.
 	Host string
 
 	// User is the username to use to authenticate to the RPC server.
@@ -138,6 +152,88 @@ func (config *ConnConfig) retrieveCookie() (username, passphrase string, err err
 
 	return config.cookieLastUser, config.cookieLastPass, config.cookieLastErr
 }
+
+// verifyPort makes sure that an address string has both a host and a port.
+// If the address is just a port, then we'll assume that the user is using the
+// shortcut to specify a localhost:port address.
+func verifyPort(address string) string {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		// If the address itself is just an integer, then we'll assume
+		// that we're mapping this directly to a localhost:port pair.
+		// This ensures we maintain the legacy behavior.
+		if _, err := strconv.Atoi(address); err == nil {
+			return net.JoinHostPort("localhost", address)
+		}
+
+		// Otherwise, we'll assume that the address just failed to
+		// attach its own port, so we'll leave it as is. In the
+		// case of IPv6 addresses, if the host is already surrounded by
+		// brackets, then we'll avoid using the JoinHostPort function,
+		// since it will always add a pair of brackets.
+		if strings.HasPrefix(address, "[") {
+			return address
+		}
+		return net.JoinHostPort(address, "")
+	}
+
+	// In the case that both the host and port are empty, we'll use an empty
+	// port.
+	if host == "" && port == "" {
+		return ":"
+	}
+
+	return address
+}
+
+// parseAddressString converts an address in string format to a net.Addr that is
+// compatible with btcd.
+func parseAddressString(strAddress string) (net.Addr, error) {
+	// Addresses can either be in unix://address URL
+	// format, or just address:port host format for tcp.
+	if after, ok := strings.CutPrefix(strAddress, "unix://"); ok {
+		return net.ResolveUnixAddr("unix", after)
+	}
+
+	if strings.Contains(strAddress, "://") {
+		// Not supporting :// anywhere in the host or path.
+		return nil, fmt.Errorf("unsupported protocol in address: %s",
+			strAddress)
+	}
+
+	// Parse it as a dummy URL to get the host and port.
+	u, err := url.Parse("dummy://" + strAddress)
+	if err != nil {
+		return nil, err
+	}
+	return net.ResolveTCPAddr("tcp", verifyPort(u.Host))
+}
+
+// newHTTPClient returns a new http client that is configured according to the
+// socket settings in the associated connection configuration.
+func newHTTPClient(config *ConnConfig) (*http.Client, error) {
+	parsedDialAddr, err := parseAddressString(config.Host)
+	if err != nil {
+		return nil, err
+	}
+	client := http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _,
+				_ string) (net.Conn, error) {
+				d := &net.Dialer{}
+				return d.DialContext(
+					ctx,
+					parsedDialAddr.Network(),
+					parsedDialAddr.String(),
+				)
+			},
+		},
+	}
+
+	return &client, nil
+}
+
+// End code adapted from btcd
 
 // New creates a new RPC client based on the provided connection configuration
 // details.  The notification handlers parameter may be nil if you are not
