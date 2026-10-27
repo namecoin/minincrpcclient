@@ -33,7 +33,12 @@ type Client struct {
 
 // TODO: ask ybbus about making auth mutable, would simplify this a lot
 func (client *Client) reset() error {
-	endpoint := "http://" + client.config.Host
+	endpoint, err := client.config.httpURL()
+	if err != nil {
+		client.c = nil
+		return err
+	}
+
 	user, pass, err := client.config.getAuth()
 	if err != nil {
 		client.c = nil
@@ -231,6 +236,29 @@ func newHTTPClient(config *ConnConfig) (*http.Client, error) {
 	}
 
 	return &client, nil
+}
+
+// httpURL returns the URL to use for HTTP POST requests.
+func (config *ConnConfig) httpURL() (string, error) {
+	protocol := "http"
+
+	parsedAddr, err := parseAddressString(config.Host)
+	if err != nil {
+		return "", fmt.Errorf("error parsing host '%v': %v",
+			config.Host, err)
+	}
+
+	var httpURL string
+	switch parsedAddr.Network() {
+	case "unix", "unixpacket":
+		// Using a placeholder URL because a non-empty URL is required.
+		// The Unix domain socket is specified in the DialContext.
+		httpURL = protocol + "://unix"
+	default:
+		httpURL = protocol + "://" + config.Host
+	}
+
+	return httpURL, nil
 }
 
 // End code adapted from btcd
